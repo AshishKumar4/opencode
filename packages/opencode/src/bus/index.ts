@@ -6,6 +6,7 @@ import { GlobalBus } from "./global"
 import { InstanceState } from "@/effect/instance-state"
 import { makeRuntime } from "@/effect/run-service"
 import { Identifier } from "@/id/id"
+import { ReplayBuffer, REPLAY_MAX_BYTES, REPLAY_MAX_ITEMS, type ReplayResult } from "@/util/replay-buffer"
 
 const log = Log.create({ service: "bus" })
 
@@ -18,7 +19,7 @@ export const InstanceDisposed = BusEvent.define(
   }),
 )
 
-type Payload<D extends BusEvent.Definition = BusEvent.Definition> = {
+export type Payload<D extends BusEvent.Definition = BusEvent.Definition> = {
   id: string
   type: D["type"]
   properties: BusProperties<D>
@@ -27,6 +28,7 @@ type Payload<D extends BusEvent.Definition = BusEvent.Definition> = {
 type State = {
   wildcard: PubSub.PubSub<Payload>
   typed: Map<string, PubSub.PubSub<Payload>>
+  replay?: ReplayBuffer<Payload>
 }
 
 export interface Interface {
@@ -37,6 +39,7 @@ export interface Interface {
   ) => Effect.Effect<void>
   readonly subscribe: <D extends BusEvent.Definition>(def: D) => Stream.Stream<Payload<D>>
   readonly subscribeAll: () => Stream.Stream<Payload>
+  readonly replay: (id?: string) => Effect.Effect<ReplayResult<Payload>>
   readonly subscribeCallback: <D extends BusEvent.Definition>(
     def: D,
     callback: (event: Payload<D>) => unknown,
@@ -53,15 +56,17 @@ export const layer = Layer.effect(
       Effect.fn("Bus.state")(function* (ctx) {
         const wildcard = yield* PubSub.unbounded<Payload>()
         const typed = new Map<string, PubSub.PubSub<Payload>>()
-
+        const data: State = { wildcard, typed }
         yield* Effect.addFinalizer(() =>
           Effect.gen(function* () {
             // Publish InstanceDisposed before shutting down so subscribers see it
-            yield* PubSub.publish(wildcard, {
+            const payload = {
               type: InstanceDisposed.type,
               id: createID(),
               properties: { directory: ctx.directory },
-            })
+            }
+            data.replay?.push(payload)
+            yield* PubSub.publish(wildcard, payload)
             yield* PubSub.shutdown(wildcard)
             for (const ps of typed.values()) {
               yield* PubSub.shutdown(ps)
@@ -69,9 +74,17 @@ export const layer = Layer.effect(
           }),
         )
 
-        return { wildcard, typed }
+        return data
       }),
     )
+
+    function enableReplay(state: State) {
+      return (state.replay ??= new ReplayBuffer<Payload>({
+        maxItems: REPLAY_MAX_ITEMS,
+        maxBytes: REPLAY_MAX_BYTES,
+        id: (event) => event.id,
+      }))
+    }
 
     function getOrCreate<D extends BusEvent.Definition>(state: State, def: D) {
       return Effect.gen(function* () {
@@ -90,6 +103,7 @@ export const layer = Layer.effect(
         const payload: Payload = { id: options?.id ?? createID(), type: def.type, properties }
         log.info("publishing", { type: def.type })
 
+        s.replay?.push(payload)
         const ps = s.typed.get(def.type)
         if (ps) yield* PubSub.publish(ps, payload)
         yield* PubSub.publish(s.wildcard, payload)
@@ -127,6 +141,10 @@ export const layer = Layer.effect(
         }),
       ).pipe(Stream.ensuring(Effect.sync(() => log.info("unsubscribing", { type: "*" }))))
     }
+
+    const replay = Effect.fn("Bus.replay")(function* (id?: string) {
+      return enableReplay(yield* InstanceState.get(state)).after(id)
+    })
 
     function on<T>(pubsub: PubSub.PubSub<T>, type: string, callback: (event: T) => unknown) {
       return Effect.gen(function* () {
@@ -170,7 +188,7 @@ export const layer = Layer.effect(
       return yield* on(s.wildcard, "*", callback)
     })
 
-    return Service.of({ publish, subscribe, subscribeAll, subscribeCallback, subscribeAllCallback })
+    return Service.of({ publish, subscribe, subscribeAll, replay, subscribeCallback, subscribeAllCallback })
   }),
 )
 
@@ -198,6 +216,10 @@ export function subscribe<D extends BusEvent.Definition>(def: D, callback: (even
 
 export function subscribeAll(callback: (event: any) => unknown) {
   return runSync((svc) => svc.subscribeAllCallback(callback))
+}
+
+export function replay(id?: string) {
+  return runSync((svc) => svc.replay(id))
 }
 
 export * as Bus from "."

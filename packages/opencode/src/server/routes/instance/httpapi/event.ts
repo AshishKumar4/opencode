@@ -2,9 +2,13 @@ import { Bus } from "@/bus"
 import * as Log from "@opencode-ai/core/util/log"
 import { Effect, Schema } from "effect"
 import * as Stream from "effect/Stream"
-import { HttpServerResponse } from "effect/unstable/http"
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
+import { Event } from "@/server/event"
+import * as SseStream from "@/server/sse"
+import { Instance, type InstanceContext } from "@/project/instance"
+import { InstanceRef } from "@/effect/instance-ref"
 
 const log = Log.create({ service: "server" })
 
@@ -28,27 +32,29 @@ export const EventApi = HttpApi.make("event").add(
     .annotateMerge(OpenApi.annotations({ title: "event", description: "Instance event stream route." })),
 )
 
-function eventData(data: unknown): Sse.Event {
+function missed(id: string) {
   return {
-    _tag: "Event",
-    event: "message",
-    id: undefined,
-    data: JSON.stringify(data),
+    id: Bus.createID(),
+    type: Event.StreamMissed.type,
+    properties: { id },
   }
 }
 
-function eventResponse(bus: Bus.Interface) {
-  const events = bus.subscribeAll().pipe(Stream.takeUntil((event) => event.type === Bus.InstanceDisposed.type))
-  const heartbeat = Stream.tick("10 seconds").pipe(
-    Stream.drop(1),
-    Stream.map(() => ({ id: Bus.createID(), type: "server.heartbeat", properties: {} })),
-  )
+function spec(ctx: InstanceContext) {
+  return {
+    id: (event: Bus.Payload) => event.id,
+    replay: (id?: string) => Effect.sync(() => Instance.restore(ctx, () => Bus.replay(id))),
+    missed,
+    connected: () => ({ id: Bus.createID(), type: Event.Connected.type, properties: {} }),
+    heartbeat: () => ({ id: Bus.createID(), type: Event.Heartbeat.type, properties: {} }),
+    end: (event: Bus.Payload) => event.type === Bus.InstanceDisposed.type,
+  }
+}
 
+function eventResponse(ctx: InstanceContext, last?: string) {
   log.info("event connected")
   return HttpServerResponse.stream(
-    Stream.make({ id: Bus.createID(), type: "server.connected", properties: {} }).pipe(
-      Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-      Stream.map(eventData),
+    SseStream.effect(last, spec(ctx), (push) => Effect.sync(() => Instance.restore(ctx, () => Bus.subscribeAll(push)))).pipe(
       Stream.pipeThroughChannel(Sse.encode()),
       Stream.encodeText,
       Stream.ensuring(Effect.sync(() => log.info("event disconnected"))),
@@ -66,11 +72,12 @@ function eventResponse(bus: Bus.Interface) {
 
 export const eventHandlers = HttpApiBuilder.group(EventApi, "event", (handlers) =>
   Effect.gen(function* () {
-    const bus = yield* Bus.Service
     return handlers.handleRaw(
       "subscribe",
       Effect.fn("EventHttpApi.subscribe")(function* () {
-        return eventResponse(bus)
+        const request = yield* HttpServerRequest.HttpServerRequest
+        const last = request.headers["last-event-id"]
+        return eventResponse((yield* InstanceRef) ?? Instance.current, last)
       }),
     )
   }),
