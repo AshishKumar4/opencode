@@ -2,10 +2,20 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
   private queue: T[] = []
   private resolvers: ((value: T) => void)[] = []
 
-  push(item: T) {
+  constructor(private readonly max = Infinity) {}
+
+  push(item: T, force = false) {
     const resolve = this.resolvers.shift()
-    if (resolve) resolve(item)
-    else this.queue.push(item)
+    if (resolve) {
+      resolve(item)
+      return true
+    }
+    if (this.queue.length >= this.max) {
+      if (!force) return false
+      this.queue.shift()
+    }
+    this.queue.push(item)
+    return true
   }
 
   async next(): Promise<T> {

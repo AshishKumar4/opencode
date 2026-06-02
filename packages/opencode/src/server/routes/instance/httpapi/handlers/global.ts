@@ -4,25 +4,40 @@ import { EffectBridge } from "@/effect/bridge"
 import { Bus } from "@/bus"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { Event } from "@/server/event"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import * as Log from "@opencode-ai/core/util/log"
-import { Effect, Queue, Schema } from "effect"
+import { Effect, Schema } from "effect"
 import * as Stream from "effect/Stream"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
+import * as SseStream from "@/server/sse"
 
 const log = Log.create({ service: "server" })
 
-function eventData(data: unknown): Sse.Event {
+function missed(id: string) {
   return {
-    _tag: "Event",
-    event: "message",
-    id: undefined,
-    data: JSON.stringify(data),
+    payload: {
+      id: Bus.createID(),
+      type: Event.StreamMissed.type,
+      properties: { id },
+    },
   }
+}
+
+function idOf(event: GlobalBusEvent) {
+  return typeof event.payload?.id === "string" ? event.payload.id : undefined
+}
+
+const spec = {
+  id: idOf,
+  replay: (id?: string) => Effect.succeed(GlobalBus.replay(id)),
+  missed,
+  connected: () => ({ payload: { id: Bus.createID(), type: Event.Connected.type, properties: {} } }),
+  heartbeat: () => ({ payload: { id: Bus.createID(), type: Event.Heartbeat.type, properties: {} } }),
 }
 
 function parseBody(body: string) {
@@ -33,24 +48,16 @@ function parseBody(body: string) {
   }
 }
 
-function eventResponse() {
+function eventResponse(last?: string) {
   log.info("global event connected")
-  const events = Stream.callback<GlobalBusEvent>((queue) => {
-    const handler = (event: GlobalBusEvent) => Queue.offerUnsafe(queue, event)
-    return Effect.acquireRelease(
-      Effect.sync(() => GlobalBus.on("event", handler)),
-      () => Effect.sync(() => GlobalBus.off("event", handler)),
-    )
-  })
-  const heartbeat = Stream.tick("10 seconds").pipe(
-    Stream.drop(1),
-    Stream.map(() => ({ payload: { id: Bus.createID(), type: "server.heartbeat", properties: {} } })),
-  )
-
   return HttpServerResponse.stream(
-    Stream.make({ payload: { id: Bus.createID(), type: "server.connected", properties: {} } }).pipe(
-      Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-      Stream.map(eventData),
+    SseStream.effect(last, spec, (push) =>
+      Effect.sync(() => {
+        const handler = (event: GlobalBusEvent) => push(event)
+        GlobalBus.on("event", handler)
+        return () => GlobalBus.off("event", handler)
+      }),
+    ).pipe(
       Stream.pipeThroughChannel(Sse.encode()),
       Stream.encodeText,
       Stream.ensuring(Effect.sync(() => log.info("global event disconnected"))),
@@ -77,7 +84,8 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
-      return eventResponse()
+      const request = yield* HttpServerRequest.HttpServerRequest
+      return eventResponse(request.headers["last-event-id"])
     })
 
     const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {
